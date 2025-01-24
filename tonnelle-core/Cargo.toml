@@ -1,0 +1,9 @@
+[package]
+name = "tonnelle-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2.169"
+rand = "0.8.5"
+socket2 = { version = "0.5.8", features = ["all"] }

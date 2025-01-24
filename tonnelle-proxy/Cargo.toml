@@ -1,0 +1,33 @@
+[package]
+name = "tonnelle-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.9.0"
+cached = "0.54.0"
+futures-io = "0.3.31"
+futures-util = { version = "0.3.31", features = ["io"] }
+http = "1.2.0"
+http-body-util = "0.1.2"
+hyper = { version = "1.5.2", features = ["full"] }
+hyper-rustls = "0.27.5"
+hyper-util = { version = "0.1.10", features = ["full"] }
+log = "0.4.25"
+once_cell = "1.20.2"
+pretty_env_logger = "0.5.0"
+rustls = { version = "0.23.21", features = ["std"] }
+tokio = { version = "1.43.0", features = ["full"] }
+tonnelle-core = { version = "0.1.0", path = "../tonnelle-core" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+pprof = { version = "0.14.0", features = ["flamegraph"] }
+reqwest = { version = "0.12.12", features = ["blocking"] }
+
+[lib]
+name = "tonnelle_proxy"
+
+[[bench]]
+name = "tonnelle"
+harness = false
