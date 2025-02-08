@@ -2,7 +2,7 @@
 
 sudo apt-get update
 sudo apt-get upgrade -y
-sudo apt-get install -y clang net-tools pkg-config libssl-dev
+sudo apt-get install -y clang net-tools pkg-config libssl-dev python-is-python3
 sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)"
 # For building faster
 sudo apt-get install -y sccache mold

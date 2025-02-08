@@ -18,7 +18,8 @@ sudo sysctl net.ipv6.ip_nonlocal_bind=1
 
 # freebind -r 2001:470:8a72::/48 -- curl -6 ifconfig.me
 sudo iptables -I INPUT 5 -p tcp --dport 1080 -j ACCEPT
-sudo iptables -I INPUT 5 -p tcp --dport 8000 -j ACCEPT
+sudo iptables -I INPUT 5 -p tcp --dport 8080 -j ACCEPT
+sudo iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
 
 # Fix kernel address maps restriction
 sudo sysctl -w kernel.kptr_restrict=0

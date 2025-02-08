@@ -1,7 +1,7 @@
 pub mod cidr;
-pub use socket2::SockAddr;
+pub use socket2::{SockAddr, Socket};
 
-use socket2::{Domain, Socket, Type};
+use socket2::{Domain, Type};
 use std::{
     io,
     net::{Ipv6Addr, SocketAddr},
