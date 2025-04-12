@@ -1,5 +1,4 @@
 use log::error;
-use std::env;
 use tonnelle_proxy::{run_http_server, run_tonnelle_proxy};
 
 #[tokio::main]
