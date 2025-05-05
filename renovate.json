@@ -3,5 +3,6 @@
   "extends": [
     "config:recommended",
     "group:allNonMajor"
-  ]
+  ],
+  "prHourlyLimit": 0
 }
