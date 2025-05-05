@@ -298,6 +298,7 @@ async fn proxy(
 
     debug!("Username: {:?}, Password: {:?}", username, password);
 
+    // HTTPS (CONNECT) handling
     if Method::CONNECT == req.method() {
         // Handle CONNECT method
         if let Some(addr) = host_addr(req.uri()) {
@@ -321,7 +322,7 @@ async fn proxy(
             Ok(resp)
         }
     } else {
-        // Handle other requests
+        // Handle other requests (HTTP)
         let host = req.uri().host().expect("uri has no host").to_string();
         info!("Connecting to: {}", host);
         let port = req.uri().port_u16().unwrap_or(80);
@@ -338,6 +339,7 @@ async fn proxy(
         let stream = TcpStream::from_std(stream_std).unwrap();
 
         if options.iter().any(|&opt| opt == "rewrite") {
+            // Rewrite the request to use HTTPS instead of HTTP (bypasses using CONNECT)
             debug!("Rewriting request to use HTTPS");
             let server_name = ServerName::try_from(host).unwrap();
             let stream = TLS_CONNECTOR.connect(server_name, stream).await.unwrap();
@@ -345,7 +347,6 @@ async fn proxy(
             let mut req = req;
             req.headers_mut().remove("Proxy-Authorization");
 
-            // Rewrite the request to use HTTPS instead of HTTP
             build_https_uri(&mut req);
 
             let io: TokioIo<TlsStream<TcpStream>> = TokioIo::new(stream);
@@ -366,6 +367,7 @@ async fn proxy(
             debug!("Completed handling proxy logic, preparing response");
             Ok(resp.map(|b| b.boxed()))
         } else {
+            // HTTP request
             let io: TokioIo<TcpStream> = TokioIo::new(stream);
 
             let (mut sender, conn) = Builder::new()
