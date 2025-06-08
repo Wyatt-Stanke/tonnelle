@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 
+# Elevate privileges
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root" 1>&2
+    exit 1
+fi
+
 sudo apt-get update
 sudo apt-get upgrade -y
-sudo apt-get install -y clang net-tools pkg-config libssl-dev python-is-python3
-sudo apt-get install -y linux-tools-common linux-tools-generic "linux-tools-$(uname -r)"
-# For building faster
-sudo apt-get install -y sccache mold
-# For building standard freebind
+sudo apt-get install -y clang net-tools pkg-config libssl-dev python-is-python3 linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" sccache mold
+# For building standard tonnelle
 # sudo apt-get install -y gcc make libnetfilter-queue-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain nightly -y
 . "$HOME/.cargo/env"
@@ -28,9 +31,11 @@ fi
 cargo install flamegraph
 
 # Run scripts/startup.sh every time the system starts
-# echo "@reboot bash $HOME/freebind/scripts/startup.sh" | crontab
+# echo "@reboot bash $HOME/tonnelle/scripts/startup.sh" | crontab
 
 # Setup gimli addr2line
 git clone https://github.com/gimli-rs/addr2line /tmp/addr2line
 cargo install --features bin --path /tmp/addr2line
+
+cargo build -r
 cd ~ || exit

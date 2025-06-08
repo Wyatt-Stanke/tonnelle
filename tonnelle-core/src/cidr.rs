@@ -24,8 +24,7 @@ impl Ipv6Cidr {
 
     pub fn generate_random_ipv6_in_subnet(&self) -> std::net::Ipv6Addr {
         let masked = u128::from(self.base_ip) & (!((1u128 << (128 - self.prefix_len)) - 1));
-        let random_bits =
-            rand::thread_rng().gen::<u128>() & ((1u128 << (128 - self.prefix_len)) - 1);
+        let random_bits = rand::rng().random::<u128>() & ((1u128 << (128 - self.prefix_len)) - 1);
         std::net::Ipv6Addr::from(masked | random_bits)
     }
 }
