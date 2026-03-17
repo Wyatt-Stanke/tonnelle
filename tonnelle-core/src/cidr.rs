@@ -1,4 +1,4 @@
-use rand::{Rng, RngExt};
+use rand::RngExt;
 use std::str::FromStr;
 
 pub struct Ipv6Cidr {
