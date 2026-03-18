@@ -14,12 +14,15 @@ impl Ipv6Cidr {
         }
     }
 
-    pub fn parse(cidr: &str) -> Self {
+    pub fn parse(cidr: &str) -> Result<Self, String> {
         let mut parts = cidr.split('/');
-        let ip_str = parts.next().unwrap();
-        let prefix_len = parts.next().unwrap().parse::<u32>().unwrap();
-        let base_ip = std::net::Ipv6Addr::from_str(ip_str).unwrap();
-        Ipv6Cidr::new(base_ip, prefix_len)
+        let ip_str = parts.next().ok_or("Missing IP part")?;
+        let prefix_len_str = parts.next().ok_or("Missing prefix length part")?;
+        let prefix_len = prefix_len_str
+            .parse::<u32>()
+            .map_err(|_| "Invalid prefix length")?;
+        let base_ip = std::net::Ipv6Addr::from_str(ip_str).map_err(|_| "Invalid IPv6 address")?;
+        Ok(Ipv6Cidr::new(base_ip, prefix_len))
     }
 
     pub fn generate_random_ipv6_in_subnet(&self) -> std::net::Ipv6Addr {

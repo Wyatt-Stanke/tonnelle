@@ -14,7 +14,6 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     collections::HashMap,
-    fmt::Debug,
     net::{Ipv6Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -22,7 +21,7 @@ use std::{
     },
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{watch, Semaphore},
 };
 use tokio_rustls::{
@@ -30,7 +29,9 @@ use tokio_rustls::{
     rustls::{ClientConfig, RootCertStore},
     TlsConnector,
 };
-use tonnelle_core::{cidr, create_ipv6_socket, SockAddr, Socket};
+use tonnelle_core::cidr;
+
+use crossbeam_queue::ArrayQueue;
 
 const TUNNEL_CIDR: &str = "2001:470:8a72::/48";
 
@@ -43,15 +44,16 @@ static TLS_CONNECTOR: Lazy<TlsConnector> = Lazy::new(|| {
     TlsConnector::from(Arc::new(config))
 });
 
-static CONCURRENCY_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(16));
-static CIDR: Lazy<cidr::Ipv6Cidr> = Lazy::new(|| cidr::Ipv6Cidr::parse(TUNNEL_CIDR));
+static CONCURRENCY_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(2048));
+static CIDR: Lazy<cidr::Ipv6Cidr> = Lazy::new(|| cidr::Ipv6Cidr::parse(TUNNEL_CIDR).unwrap());
 static SHUTDOWN_CHANNEL: Lazy<Mutex<(watch::Sender<()>, watch::Receiver<()>)>> =
     Lazy::new(|| Mutex::new(watch::channel(())));
 
-static ADDR_CACHE: Lazy<Mutex<HashMap<String, SocketAddr>>> =
+static ADDR_CACHE: Lazy<Mutex<HashMap<(String, u16), SocketAddr>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-static WARM_SOCKETS: Mutex<Vec<(Socket, Ipv6Addr)>> = Mutex::new(Vec::new());
+static WARM_SOCKETS: Lazy<ArrayQueue<(std::net::TcpStream, Ipv6Addr)>> =
+    Lazy::new(|| ArrayQueue::new(1024));
 static WARM_SOCKETS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Serialize)]
@@ -59,10 +61,11 @@ struct Status {
     warm_sockets: usize,
 }
 
-async fn to_ipv6_socket_addr_async<T: tokio::net::ToSocketAddrs + Debug + Clone>(
-    input: T,
+async fn to_ipv6_socket_addr_async(
+    host: &str,
+    port: u16,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let key = format!("{:?}", &input);
+    let key = (host.to_string(), port);
     let addr = {
         let cache = ADDR_CACHE.lock();
         cache.get(&key).cloned()
@@ -72,7 +75,7 @@ async fn to_ipv6_socket_addr_async<T: tokio::net::ToSocketAddrs + Debug + Clone>
         debug!("Resolved from cache: {}", addr);
         Ok(addr)
     } else {
-        let resolved = tokio::net::lookup_host(&input)
+        let resolved = tokio::net::lookup_host((host, port))
             .await?
             .find(|addr| addr.is_ipv6())
             .ok_or("No IPv6 address found")?;
@@ -85,67 +88,69 @@ async fn to_ipv6_socket_addr_async<T: tokio::net::ToSocketAddrs + Debug + Clone>
 async fn warmup_sockets(num: usize) {
     debug!("Warming up {} sockets", num);
 
-    let mut sockets = Vec::new();
+    let mut added = 0;
     for _ in 0..num {
         let addr = CIDR.generate_random_ipv6_in_subnet();
-        let socket = unsafe { create_ipv6_socket(addr).unwrap() };
-        sockets.push((socket, addr));
+        if let Ok(socket) = tonnelle_core::create_ipv6_socket(addr) {
+            if WARM_SOCKETS.push((socket, addr)).is_ok() {
+                added += 1;
+            } else {
+                break;
+            }
+        }
     }
 
-    WARM_SOCKETS_COUNT.fetch_add(num, Ordering::Relaxed);
-    WARM_SOCKETS.lock().extend(sockets);
-
-    debug!("Warmed up {} sockets", num);
+    WARM_SOCKETS_COUNT.fetch_add(added, Ordering::Relaxed);
+    debug!("Warmed up {} sockets", added);
 }
 
-async fn get_socket() -> Socket {
-    let num_sockets = WARM_SOCKETS_COUNT.load(Ordering::Relaxed);
-    if num_sockets > 1 {
-        debug!("Using warm socket ({} available)", num_sockets);
-        let socket = WARM_SOCKETS.lock().pop().unwrap();
+async fn get_socket() -> Result<std::net::TcpStream, std::io::Error> {
+    if let Some(socket) = WARM_SOCKETS.pop() {
+        debug!("Using warm socket");
         WARM_SOCKETS_COUNT.fetch_sub(1, Ordering::Relaxed);
         debug!("Socket addr: {:?}", socket.1);
-        socket.0
+        Ok(socket.0)
     } else {
         tokio::task::spawn(async {
             warmup_sockets(16).await;
         });
 
         let addr = CIDR.generate_random_ipv6_in_subnet();
-        let socket = unsafe { create_ipv6_socket(addr).unwrap() };
-        socket.into()
+        tonnelle_core::create_ipv6_socket(addr)
     }
 }
 
 fn parse_credentials(header_val: &str) -> (Option<String>, Option<String>) {
-    let parts: Vec<&str> = header_val.split_whitespace().collect();
-    if parts.len() == 2 && parts[0] == "Basic" {
-        let decoded = BASE64_STANDARD.decode(parts[1]).ok().unwrap();
-        let decoded = String::from_utf8(decoded).ok().unwrap();
-        let parts: Vec<&str> = decoded.split(':').collect();
-        if parts.len() == 2 {
-            (Some(parts[0].to_string()), Some(parts[1].to_string()))
-        } else if parts.len() == 1 {
-            (Some(parts[0].to_string()), None)
-        } else {
-            (None, None)
+    if let Some(("Basic", encoded)) = header_val.split_once(' ') {
+        if let Ok(decoded) = BASE64_STANDARD.decode(encoded.trim()) {
+            if let Ok(decoded_str) = String::from_utf8(decoded) {
+                if let Some((user, pass)) = decoded_str.split_once(':') {
+                    return (Some(user.to_string()), Some(pass.to_string()));
+                } else {
+                    return (Some(decoded_str), None);
+                }
+            }
         }
-    } else {
-        (None, None)
     }
+    (None, None)
 }
 
 fn build_https_uri(req: &mut http::Request<hyper::body::Incoming>) {
     let uri = req.uri_mut();
     let scheme = uri.scheme_str().unwrap_or("https");
-    let authority = uri.authority().unwrap();
-    let path_and_query = uri.path_and_query().unwrap();
-    *uri = http::Uri::builder()
+    let authority = uri.authority().map(|a| a.to_string()).unwrap_or_default();
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.to_string())
+        .unwrap_or_else(|| "/".to_string());
+    if let Ok(new_uri) = http::Uri::builder()
         .scheme(scheme)
-        .authority(authority.to_string())
-        .path_and_query(path_and_query.to_string())
+        .authority(authority)
+        .path_and_query(path_and_query)
         .build()
-        .unwrap();
+    {
+        *uri = new_uri;
+    }
 }
 
 fn debug_or_prod_addr() -> SocketAddr {
@@ -288,7 +293,8 @@ async fn proxy(
     let (username, password) = req
         .headers()
         .get("Proxy-Authorization")
-        .map(|header| parse_credentials(header.to_str().ok().unwrap()))
+        .and_then(|header| header.to_str().ok())
+        .map(parse_credentials)
         .unwrap_or((None, None));
 
     let options = username
@@ -327,22 +333,58 @@ async fn proxy(
         info!("Connecting to: {}", host);
         let port = req.uri().port_u16().unwrap_or(80);
 
-        let socket = get_socket().await;
+        let socket = match get_socket().await {
+            Ok(s) => s,
+            Err(e) => {
+                info!("Failed to create socket: {}", e);
+                let mut resp = Response::new(full("Failed to create socket"));
+                *resp.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+                return Ok(resp);
+            }
+        };
         debug!("Created new socket");
-        let socket_addr = to_ipv6_socket_addr_async((host.as_str(), port))
-            .await
-            .unwrap();
+        let socket_addr = match to_ipv6_socket_addr_async(host.as_str(), port).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                info!("Failed to resolve host: {}", e);
+                let mut resp = Response::new(full("Failed to resolve host"));
+                *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                return Ok(resp);
+            }
+        };
 
-        socket.connect(&SockAddr::from(socket_addr)).unwrap();
-
-        let stream_std: std::net::TcpStream = socket.into();
-        let stream = TcpStream::from_std(stream_std).unwrap();
+        let tcp_socket = tokio::net::TcpSocket::from_std_stream(socket);
+        let stream = match tcp_socket.connect(socket_addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                info!("Failed to connect: {}", e);
+                let mut resp = Response::new(full("Failed to connect"));
+                *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                return Ok(resp);
+            }
+        };
 
         if options.iter().any(|&opt| opt == "rewrite") {
             // Rewrite the request to use HTTPS instead of HTTP (bypasses using CONNECT)
             debug!("Rewriting request to use HTTPS");
-            let server_name = ServerName::try_from(host).unwrap();
-            let stream = TLS_CONNECTOR.connect(server_name, stream).await.unwrap();
+            let server_name = match ServerName::try_from(host.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    info!("Invalid server name {}: {}", host, e);
+                    let mut resp = Response::new(full("Invalid server name"));
+                    *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                    return Ok(resp);
+                }
+            };
+            let stream = match TLS_CONNECTOR.connect(server_name, stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    info!("TLS connection failed: {}", e);
+                    let mut resp = Response::new(full("TLS connection failed"));
+                    *resp.status_mut() = http::StatusCode::BAD_GATEWAY;
+                    return Ok(resp);
+                }
+            };
 
             let mut req = req;
             req.headers_mut().remove("Proxy-Authorization");
@@ -410,12 +452,23 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     // Connect tunnel to remote server
     debug!("Establishing tunnel connection");
-    let socket = get_socket().await;
-    let socket_addr = to_ipv6_socket_addr_async(&addr).await.unwrap();
-    socket.connect(&SockAddr::from(socket_addr)).unwrap();
+    let socket = get_socket().await?;
+    let (host, port) = addr.split_once(':').unwrap_or((&addr, "443"));
+    let port: u16 = port.parse().unwrap_or(443);
+    let socket_addr = match to_ipv6_socket_addr_async(host, port).await {
+        Ok(addr) => addr,
+        Err(e) => {
+            info!("Failed to resolve tunnel host: {e}");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ));
+        }
+    };
+
+    let tcp_socket = tokio::net::TcpSocket::from_std_stream(socket);
+    let mut stream = tcp_socket.connect(socket_addr).await?;
     debug!("Bound new socket to: {}", addr);
-    let stream_std: std::net::TcpStream = socket.into();
-    let mut stream = TcpStream::from_std(stream_std).unwrap();
 
     let mut upgraded = TokioIo::new(upgraded);
 
