@@ -2,9 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:best-practices",
-    "helpers:pinGitHubActionDigests",
-    "group:allNonMajor",
-    ":pinVersions"
+    "helpers:pinGitHubActionDigests"
   ],
   "prHourlyLimit": 0
 }
