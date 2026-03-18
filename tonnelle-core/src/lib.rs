@@ -23,6 +23,8 @@ pub fn create_tcp_stream(
     dest: impl Into<SocketAddr>,
 ) -> Result<std::net::TcpStream, io::Error> {
     let socket: Socket = create_ipv6_socket(addr)?.into();
+    // Ensure a blocking connect, since create_ipv6_socket sets the socket to non-blocking.
+    socket.set_nonblocking(false)?;
     socket.connect(&SockAddr::from(dest.into()))?;
 
     Ok(socket.into())

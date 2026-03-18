@@ -10,6 +10,7 @@ use log::{debug, error, info};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rustls_pki_types::ServerName;
+use std::sync::atomic::AtomicBool;
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -85,6 +86,8 @@ async fn to_ipv6_socket_addr_async(
     }
 }
 
+static WARMUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
 async fn warmup_sockets(num: usize) {
     debug!("Warming up {} sockets", num);
 
@@ -107,13 +110,34 @@ async fn warmup_sockets(num: usize) {
 async fn get_socket() -> Result<std::net::TcpStream, std::io::Error> {
     if let Some(socket) = WARM_SOCKETS.pop() {
         debug!("Using warm socket");
-        WARM_SOCKETS_COUNT.fetch_sub(1, Ordering::Relaxed);
+        // Decrement the warm socket count in a saturating manner to avoid underflow
+        loop {
+            let current = WARM_SOCKETS_COUNT.load(Ordering::Relaxed);
+            if current == 0 {
+                break;
+            }
+            if WARM_SOCKETS_COUNT
+                .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
         debug!("Socket addr: {:?}", socket.1);
         Ok(socket.0)
     } else {
-        tokio::task::spawn(async {
-            warmup_sockets(16).await;
-        });
+        // Only start a warmup task if one is not already in progress.
+        if !WARMUP_IN_PROGRESS.load(Ordering::Acquire) {
+            if WARMUP_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                tokio::task::spawn(async {
+                    warmup_sockets(16).await;
+                    WARMUP_IN_PROGRESS.store(false, Ordering::Release);
+                });
+            }
+        }
 
         let addr = CIDR.generate_random_ipv6_in_subnet();
         tonnelle_core::create_ipv6_socket(addr)
@@ -453,8 +477,29 @@ async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     // Connect tunnel to remote server
     debug!("Establishing tunnel connection");
     let socket = get_socket().await?;
-    let (host, port) = addr.split_once(':').unwrap_or((&addr, "443"));
-    let port: u16 = port.parse().unwrap_or(443);
+    // Parse host and port from addr, supporting IPv6 (including bracketed form).
+    let (host, port_str) = if addr.starts_with('[') {
+        // Bracketed IPv6: [host]:port or [host]
+        if let Some(end_bracket) = addr.find(']') {
+            let host = &addr[1..end_bracket];
+            let port_str = if addr.len() > end_bracket + 1 && &addr[end_bracket + 1..=end_bracket + 1] == ":" {
+                &addr[end_bracket + 2..]
+            } else {
+                "443"
+            };
+            (host, port_str)
+        } else {
+            // Malformed: treat entire addr (without leading '[') as host, default port
+            (&addr[..], "443")
+        }
+    } else {
+        // Unbracketed form: split on last ':' to distinguish host:port
+        match addr.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() => (h, p),
+            _ => (&addr[..], "443"),
+        }
+    };
+    let port: u16 = port_str.parse().unwrap_or(443);
     let socket_addr = match to_ipv6_socket_addr_async(host, port).await {
         Ok(addr) => addr,
         Err(e) => {
