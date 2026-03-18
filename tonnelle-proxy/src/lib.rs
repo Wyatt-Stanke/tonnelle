@@ -21,7 +21,7 @@ use std::{
     },
 };
 use tokio::{
-    net::{TcpListener, TcpSocket, TcpStream},
+    net::{TcpListener, TcpStream},
     sync::{watch, Semaphore},
 };
 use tokio_rustls::{
