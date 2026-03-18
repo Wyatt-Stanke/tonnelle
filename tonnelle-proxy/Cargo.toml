@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 base64 = "0.22.1"
 bytes = "1.9.0"
+crossbeam-queue = "0.3.12"
 futures-io = "0.3.31"
 futures-util = { version = "0.3.31", features = ["io"] }
 http = "1.2.0"
