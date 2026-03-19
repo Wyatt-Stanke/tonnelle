@@ -7,7 +7,7 @@ use std::{
     net::{Ipv6Addr, SocketAddr},
 };
 
-pub fn create_ipv6_socket(addr: Ipv6Addr) -> Result<std::net::TcpStream, io::Error> {
+pub fn create_bound_ipv6_socket(addr: Ipv6Addr) -> Result<std::net::TcpStream, io::Error> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, None)?;
 
     socket.set_freebind_v4(true)?;
@@ -22,8 +22,8 @@ pub fn create_tcp_stream(
     addr: Ipv6Addr,
     dest: impl Into<SocketAddr>,
 ) -> Result<std::net::TcpStream, io::Error> {
-    let socket: Socket = create_ipv6_socket(addr)?.into();
-    // Ensure a blocking connect, since create_ipv6_socket sets the socket to non-blocking.
+    let socket: Socket = create_bound_ipv6_socket(addr)?.into();
+    // Ensure a blocking connect, since create_bound_ipv6_socket sets the socket to non-blocking.
     socket.set_nonblocking(false)?;
     socket.connect(&SockAddr::from(dest.into()))?;
 

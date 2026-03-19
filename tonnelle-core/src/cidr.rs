@@ -21,13 +21,24 @@ impl Ipv6Cidr {
         let prefix_len = prefix_len_str
             .parse::<u32>()
             .map_err(|_| "Invalid prefix length")?;
+        if prefix_len > 128 {
+            return Err(format!(
+                "Prefix length {} is out of range (must be 0..=128)",
+                prefix_len
+            ));
+        }
         let base_ip = std::net::Ipv6Addr::from_str(ip_str).map_err(|_| "Invalid IPv6 address")?;
         Ok(Ipv6Cidr::new(base_ip, prefix_len))
     }
 
     pub fn generate_random_ipv6_in_subnet(&self) -> std::net::Ipv6Addr {
-        let masked = u128::from(self.base_ip) & (!((1u128 << (128 - self.prefix_len)) - 1));
-        let random_bits = rand::rng().random::<u128>() & ((1u128 << (128 - self.prefix_len)) - 1);
+        let host_bits = 128 - self.prefix_len;
+        // Use checked_shl to avoid overflow when host_bits == 128 (prefix_len == 0).
+        let host_mask = 1u128
+            .checked_shl(host_bits)
+            .map_or(u128::MAX, |v| v - 1);
+        let masked = u128::from(self.base_ip) & !host_mask;
+        let random_bits = rand::rng().random::<u128>() & host_mask;
         std::net::Ipv6Addr::from(masked | random_bits)
     }
 }

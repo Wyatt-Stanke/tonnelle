@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     net::{Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::Ordering,
         Arc,
     },
 };
@@ -45,7 +45,13 @@ static TLS_CONNECTOR: Lazy<TlsConnector> = Lazy::new(|| {
     TlsConnector::from(Arc::new(config))
 });
 
-static CONCURRENCY_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(2048));
+static CONCURRENCY_SEM: Lazy<Semaphore> = Lazy::new(|| {
+    let limit = std::env::var("CONCURRENCY_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512);
+    Semaphore::new(limit)
+});
 static CIDR: Lazy<cidr::Ipv6Cidr> = Lazy::new(|| cidr::Ipv6Cidr::parse(TUNNEL_CIDR).unwrap());
 static SHUTDOWN_CHANNEL: Lazy<Mutex<(watch::Sender<()>, watch::Receiver<()>)>> =
     Lazy::new(|| Mutex::new(watch::channel(())));
@@ -55,7 +61,6 @@ static ADDR_CACHE: Lazy<Mutex<HashMap<(String, u16), SocketAddr>>> =
 
 static WARM_SOCKETS: Lazy<ArrayQueue<(std::net::TcpStream, Ipv6Addr)>> =
     Lazy::new(|| ArrayQueue::new(1024));
-static WARM_SOCKETS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Serialize)]
 struct Status {
@@ -94,7 +99,7 @@ async fn warmup_sockets(num: usize) {
     let mut added = 0;
     for _ in 0..num {
         let addr = CIDR.generate_random_ipv6_in_subnet();
-        if let Ok(socket) = tonnelle_core::create_ipv6_socket(addr) {
+        if let Ok(socket) = tonnelle_core::create_bound_ipv6_socket(addr) {
             if WARM_SOCKETS.push((socket, addr)).is_ok() {
                 added += 1;
             } else {
@@ -103,55 +108,43 @@ async fn warmup_sockets(num: usize) {
         }
     }
 
-    WARM_SOCKETS_COUNT.fetch_add(added, Ordering::Relaxed);
     debug!("Warmed up {} sockets", added);
 }
 
 async fn get_socket() -> Result<std::net::TcpStream, std::io::Error> {
     if let Some(socket) = WARM_SOCKETS.pop() {
         debug!("Using warm socket");
-        // Decrement the warm socket count in a saturating manner to avoid underflow
-        loop {
-            let current = WARM_SOCKETS_COUNT.load(Ordering::Relaxed);
-            if current == 0 {
-                break;
-            }
-            if WARM_SOCKETS_COUNT
-                .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
         debug!("Socket addr: {:?}", socket.1);
         Ok(socket.0)
     } else {
         // Only start a warmup task if one is not already in progress.
-        if !WARMUP_IN_PROGRESS.load(Ordering::Acquire) {
-            if WARMUP_IN_PROGRESS
+        if !WARMUP_IN_PROGRESS.load(Ordering::Acquire)
+            && WARMUP_IN_PROGRESS
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
-            {
-                tokio::task::spawn(async {
-                    warmup_sockets(16).await;
-                    WARMUP_IN_PROGRESS.store(false, Ordering::Release);
-                });
-            }
+        {
+            tokio::task::spawn(async {
+                warmup_sockets(16).await;
+                WARMUP_IN_PROGRESS.store(false, Ordering::Release);
+            });
         }
 
         let addr = CIDR.generate_random_ipv6_in_subnet();
-        tonnelle_core::create_ipv6_socket(addr)
+        tonnelle_core::create_bound_ipv6_socket(addr)
     }
 }
 
 fn parse_credentials(header_val: &str) -> (Option<String>, Option<String>) {
-    if let Some(("Basic", encoded)) = header_val.split_once(' ') {
-        if let Ok(decoded) = BASE64_STANDARD.decode(encoded.trim()) {
-            if let Ok(decoded_str) = String::from_utf8(decoded) {
-                if let Some((user, pass)) = decoded_str.split_once(':') {
-                    return (Some(user.to_string()), Some(pass.to_string()));
-                } else {
-                    return (Some(decoded_str), None);
+    let mut parts = header_val.splitn(2, char::is_whitespace);
+    if let (Some(scheme), Some(encoded)) = (parts.next(), parts.next()) {
+        if scheme.eq_ignore_ascii_case("Basic") {
+            if let Ok(decoded) = BASE64_STANDARD.decode(encoded.trim()) {
+                if let Ok(decoded_str) = String::from_utf8(decoded) {
+                    if let Some((user, pass)) = decoded_str.split_once(':') {
+                        return (Some(user.to_string()), Some(pass.to_string()));
+                    } else {
+                        return (Some(decoded_str), None);
+                    }
                 }
             }
         }
@@ -159,7 +152,7 @@ fn parse_credentials(header_val: &str) -> (Option<String>, Option<String>) {
     (None, None)
 }
 
-fn build_https_uri(req: &mut http::Request<hyper::body::Incoming>) {
+fn build_https_uri(req: &mut http::Request<hyper::body::Incoming>) -> Result<(), http::Error> {
     let uri = req.uri_mut();
     let scheme = uri.scheme_str().unwrap_or("https");
     let authority = uri.authority().map(|a| a.to_string()).unwrap_or_default();
@@ -167,14 +160,13 @@ fn build_https_uri(req: &mut http::Request<hyper::body::Incoming>) {
         .path_and_query()
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/".to_string());
-    if let Ok(new_uri) = http::Uri::builder()
+    let new_uri = http::Uri::builder()
         .scheme(scheme)
         .authority(authority)
         .path_and_query(path_and_query)
-        .build()
-    {
-        *uri = new_uri;
-    }
+        .build()?;
+    *uri = new_uri;
+    Ok(())
 }
 
 fn debug_or_prod_addr() -> SocketAddr {
@@ -201,7 +193,7 @@ async fn mgmt_service(
         return Ok(resp);
     } else if req.uri().path() == "/status" {
         let status = Status {
-            warm_sockets: WARM_SOCKETS_COUNT.load(Ordering::Relaxed),
+            warm_sockets: WARM_SOCKETS.len(),
         };
         let body = full(json!(status).to_string());
         let mut resp = Response::new(body);
@@ -388,7 +380,7 @@ async fn proxy(
             }
         };
 
-        if options.iter().any(|&opt| opt == "rewrite") {
+        if options.contains(&"rewrite") {
             // Rewrite the request to use HTTPS instead of HTTP (bypasses using CONNECT)
             debug!("Rewriting request to use HTTPS");
             let server_name = match ServerName::try_from(host.clone()) {
@@ -413,7 +405,12 @@ async fn proxy(
             let mut req = req;
             req.headers_mut().remove("Proxy-Authorization");
 
-            build_https_uri(&mut req);
+            if let Err(e) = build_https_uri(&mut req) {
+                info!("Failed to build HTTPS URI: {}", e);
+                let mut resp = Response::new(full("Failed to build request URI"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                return Ok(resp);
+            }
 
             let io: TokioIo<TlsStream<TcpStream>> = TokioIo::new(stream);
 
@@ -478,25 +475,27 @@ async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
     debug!("Establishing tunnel connection");
     let socket = get_socket().await?;
     // Parse host and port from addr, supporting IPv6 (including bracketed form).
-    let (host, port_str) = if addr.starts_with('[') {
+    let (host, port_str) = if let Some(rest) = addr.strip_prefix('[') {
         // Bracketed IPv6: [host]:port or [host]
-        if let Some(end_bracket) = addr.find(']') {
-            let host = &addr[1..end_bracket];
-            let port_str = if addr.len() > end_bracket + 1 && &addr[end_bracket + 1..=end_bracket + 1] == ":" {
-                &addr[end_bracket + 2..]
-            } else {
-                "443"
-            };
+        if let Some(end_bracket) = rest.find(']') {
+            let host = &rest[..end_bracket];
+            let after_bracket = &rest[end_bracket + 1..];
+            let port_str = after_bracket.strip_prefix(':').unwrap_or("443");
             (host, port_str)
         } else {
-            // Malformed: treat entire addr (without leading '[') as host, default port
-            (&addr[..], "443")
+            // Malformed bracketed form: use the content after '[' as host, default port
+            (rest, "443")
         }
     } else {
-        // Unbracketed form: split on last ':' to distinguish host:port
-        match addr.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() => (h, p),
-            _ => (&addr[..], "443"),
+        // Unbracketed form: if multiple colons it's a bare IPv6 literal (no port)
+        if addr.matches(':').nth(1).is_some() {
+            // Bare IPv6 literal without brackets; no port can be extracted
+            (&addr[..], "443")
+        } else {
+            match addr.rsplit_once(':') {
+                Some((h, p)) if !p.is_empty() => (h, p),
+                _ => (&addr[..], "443"),
+            }
         }
     };
     let port: u16 = port_str.parse().unwrap_or(443);
@@ -504,10 +503,7 @@ async fn tunnel(upgraded: Upgraded, addr: String) -> std::io::Result<()> {
         Ok(addr) => addr,
         Err(e) => {
             info!("Failed to resolve tunnel host: {e}");
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ));
+            return Err(std::io::Error::other(e.to_string()));
         }
     };
 
